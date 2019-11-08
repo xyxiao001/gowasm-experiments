@@ -16,7 +16,6 @@ import (
 
 func main() {
 	c, err := NewCanvasClient("wss:/arty.us.hexasoftware.com")
-
 	if err != nil {
 		log.Fatal("could not start", err)
 	}
@@ -38,6 +37,8 @@ type CanvasClient struct {
 	ctx      js.Value
 	ws       js.Value
 	im       js.Value
+	// will hold js part of the image
+	byteArray js.Value
 
 	colorHex  string
 	lineWidth float64
@@ -82,8 +83,10 @@ func (c *CanvasClient) initCanvas() {
 	c.height = c.canvasEl.Get("height").Float()
 	c.ctx = c.canvasEl.Call("getContext", "2d")
 	c.im = c.ctx.Call("createImageData", 1, 1)
+	c.byteArray = js.Global().Get("Uint8Array").New(1 * 4)
 	c.painter.OnInit = func(m painter.InitOP) {
 		c.im = c.ctx.Call("createImageData", m.Width, m.Height)
+		c.byteArray = js.Global().Get("Uint8Array").New(m.Width * m.Height * 4)
 		c.SetStatus("connected")
 		c.initEvents()
 	}
@@ -92,10 +95,11 @@ func (c *CanvasClient) initCanvas() {
 func (c *CanvasClient) initFrameUpdate() {
 	// Hold the callbacks without blocking
 	go func() {
-		var renderFrame js.Callback
-		renderFrame = js.NewCallback(func(args []js.Value) {
+		var renderFrame js.Func
+		renderFrame = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 			c.draw()
 			js.Global().Call("requestAnimationFrame", renderFrame)
+			return nil
 		})
 		defer renderFrame.Release()
 		js.Global().Call("requestAnimationFrame", renderFrame)
@@ -107,12 +111,14 @@ func (c *CanvasClient) initConnection() {
 	go func() {
 		c.SetStatus("connecting...")
 		c.ws = js.Global().Get("WebSocket").New(c.addr)
-		onopen := js.NewCallback(func(args []js.Value) {
-			c.SetStatus("receiving...")
+		onopen := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+			c.SetStatus("receiving... (it takes some time)")
+			return nil
 		})
 		defer onopen.Release()
-		onmessage := js.NewCallback(func(args []js.Value) {
+		onmessage := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 			c.painter.HandleRaw([]byte(args[0].Get("data").String()))
+			return nil
 		})
 		defer onmessage.Release()
 		c.ws.Set("onopen", onopen)
@@ -124,14 +130,16 @@ func (c *CanvasClient) initConnection() {
 func (c *CanvasClient) initEvents() {
 	go func() {
 		// DOM events
-		colorEvt := js.NewCallback(func(args []js.Value) {
+		colorEvt := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 			e := args[0]
 			c.colorHex = e.Get("target").Get("value").String()
+			return nil
 		})
-		szEvt := js.NewCallback(func(args []js.Value) {
+		szEvt := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 			e := args[0]
 			v, _ := strconv.ParseFloat(e.Get("target").Get("value").String(), 64)
 			c.lineWidth = v
+			return nil
 		})
 		defer szEvt.Release()
 
@@ -140,41 +148,47 @@ func (c *CanvasClient) initEvents() {
 
 		// Input events
 		mouseDown := false
-		mouseDownEvt := js.NewEventCallback(0, func(e js.Value) {
+		mouseDownEvt := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+			e := args[0]
 			if e.Get("target") != c.canvasEl || e.Get("buttons").Float() != 1 {
-				return
+				return nil
 			}
 			mouseDown = true
 			if !e.Get("shiftKey").Bool() {
 				c.lastPos.x = e.Get("pageX").Float()
 				c.lastPos.y = e.Get("pageY").Float()
 				c.textOff = pos{} // reset
-				return
+				return nil
 			}
 			c.drawAtPointer(e)
+			return nil
 		})
 		defer mouseDownEvt.Release()
 
-		mouseUpEvt := js.NewCallback(func(args []js.Value) {
+		mouseUpEvt := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 			mouseDown = false
+			return nil
 		})
 		defer mouseUpEvt.Release()
 
-		mouseMoveEvt := js.NewCallback(func(args []js.Value) {
+		mouseMoveEvt := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 			if !mouseDown {
-				return
+				return nil
 			}
 			c.drawAtPointer(args[0])
+			return nil
 		})
 
-		keyPressEvt := js.NewEventCallback(js.PreventDefault, func(e js.Value) {
+		keyPressEvt := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+			e := args[0]
+			e.Call("preventDefault")
 			key := e.Get("key").String()
 			if key == "Enter" {
 				c.textOff.x = 0
 				c.textOff.y += (c.lineWidth + 10)
 			}
 			if len(key) != 1 {
-				return
+				return nil
 			}
 			col, _ := colorful.Hex(c.colorHex) // Ignore error
 			op := painter.TextOP{
@@ -188,9 +202,10 @@ func (c *CanvasClient) initEvents() {
 			c.painter.HandleOP(op)
 			buf, err := json.Marshal(painter.Message{op})
 			if err != nil {
-				return
+				return nil
 			}
 			c.ws.Call("send", string(buf))
+			return nil
 
 		})
 		defer keyPressEvt.Release()
@@ -229,8 +244,8 @@ func (c *CanvasClient) SetStatus(txt string) {
 }
 func (c *CanvasClient) draw() {
 	// golang buffer
-	ta := js.TypedArrayOf(c.painter.ImageData())
-	c.im.Get("data").Call("set", ta)
-	ta.Release()
+	// Needs to be a Uint8Array while image data have Uint8ClampedArray
+	js.CopyBytesToJS(c.byteArray, c.painter.ImageData())
+	c.im.Get("data").Call("set", c.byteArray)
 	c.ctx.Call("putImageData", c.im, 0, 0)
 }
